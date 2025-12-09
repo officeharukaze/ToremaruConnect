@@ -1,0 +1,236 @@
+name: Release Build
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
+    inputs:
+      use_temp_keystore:
+        description: 'Set to true to force using a temporary keystore even if KEYSTORE_BASE64 is set'
+        required: false
+        default: 'false'
+
+jobs:
+  build-release:
+    name: Build Release AAB/APK
+    if: github.ref != 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      ver_name: ${{ steps.set-ver.outputs.ver_name }}
+      ver_code: ${{ steps.set-ver.outputs.ver_code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Debug - Java / Gradle info
+        run: |
+          echo "=== java -version ==="
+          java -version || true
+          echo "=== gradle --version ==="
+          ./gradlew --version || true
+          echo "=== workspace files (top) ==="
+          ls -la || true
+          echo "=== version.properties content ==="
+          if [ -f version.properties ]; then cat version.properties || true; else echo "(not found)"; fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper/
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+
+      - name: Prepare keystore (restore from secret or generate temporary)
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          # allow forcing temporary keystore either via workflow_dispatch input or repository secret FORCE_TEMP
+          FORCE_TEMP: ${{ secrets.FORCE_TEMP || github.event.inputs.use_temp_keystore || 'false' }}
+        run: |
+          echo "FORCE_TEMP=${FORCE_TEMP}"
+          if [ "${FORCE_TEMP}" = "true" ] || [ -z "${KEYSTORE_BASE64}" ]; then
+            echo "Using temporary keystore (forced=${FORCE_TEMP}, secret_present=$( [ -n "${KEYSTORE_BASE64}" ] && echo true || echo false ))"
+            keytool -genkeypair -v -keystore my-release-key.jks -storepass password -keypass password -alias my-key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=tmp,OU=dev,O=dev,L=Tokyo,S=Tokyo,C=JP"
+            echo "Temporary keystore created at $(pwd)/my-release-key.jks"
+          else
+            echo "Restoring keystore from KEYSTORE_BASE64"
+            echo "$KEYSTORE_BASE64" | base64 --decode > my-release-key.jks
+            echo "Keystore restored from secret"
+          fi
+
+      - name: Show version
+        run: |
+          if [ -f version.properties ]; then grep -n "VERSION_" version.properties || true; else echo "version.properties not found"; fi
+
+      - name: Debug - list keystore aliases (uses secret if available)
+        run: |
+          if [ -f my-release-key.jks ]; then
+            echo "my-release-key.jks found at $(pwd)/my-release-key.jks"
+            if [ -n "${{ secrets.KEYSTORE_PASSWORD }}" ]; then
+              echo "KEYSTORE_PASSWORD is set — attempting keytool list using secret (output will be masked)"
+              keytool -list -v -keystore my-release-key.jks -storepass "${{ secrets.KEYSTORE_PASSWORD }}" || echo "keytool exited with non-zero"
+            else
+              echo "KEYSTORE_PASSWORD not set — attempting keytool list without password (may fail)"
+              keytool -list -v -keystore my-release-key.jks || echo "keytool exited with non-zero"
+            fi
+          else
+            echo "my-release-key.jks not found"
+          fi
+
+      - name: Build release
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -f my-release-key.jks ]; then
+            echo "Keystore found — building signed release"
+          else
+            echo "Keystore not found. If your Gradle signing config expects a keystore at project root, build may fail."
+          fi
+          # 初回リリース時は incrementVersionCode をスキップ
+          VER_NAME=""
+          VER_CODE=""
+          if [ -f version.properties ]; then
+            VER_NAME=$(grep -E '^VERSION_NAME=' version.properties | cut -d= -f2- | tr -d '\r' || true)
+            VER_CODE=$(grep -E '^VERSION_CODE=' version.properties | cut -d= -f2- | tr -d '\r' || true)
+          fi
+          TAG="v${VER_NAME}-${VER_CODE}"
+          echo "Checking if tag $TAG exists..."
+          # Build signed release. Do NOT increment version here — increment will be done after successful publish.
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Capture release artifacts (robust)
+        run: |
+          echo "Locating built APK/AAB files and copying to artifacts/apk/release"
+          set -e
+          mkdir -p artifacts/apk/release
+          # Try project-specific task first if present
+          if ./gradlew tasks --all | grep -q renameReleaseApk; then
+            echo "Found renameReleaseApk task — invoking it"
+            ./gradlew :app:renameReleaseApk --no-daemon --stacktrace || true
+          fi
+          # Collect APK/AAB outputs from common output locations
+          FOUND=0
+          # Find APKs and AABs under app/build/outputs
+          for f in $(find app/build/outputs -type f \( -name "*.apk" -o -name "*.aab" \) -print 2>/dev/null); do
+            echo "Copying $f"
+            cp "$f" artifacts/apk/release/ || true
+            FOUND=1
+          done
+          # Also consider outputs under app/build/outputs/apk/**/release
+          if [ $FOUND -eq 0 ]; then
+            echo "No APK/AAB found in app/build/outputs — listing directories for debugging:"; ls -la app/build/outputs || true
+            # Do not fail hard here to allow upstream steps to handle absence
+          else
+            echo "Copied artifacts:"; ls -la artifacts/apk/release || true
+          fi
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: |
+            artifacts/apk/release/*.apk
+            app/build/outputs/**/*.aab
+            app/build/outputs/**/*.apk
+
+      - name: Set release version output
+        id: set-ver
+        run: |
+          VER_NAME=""
+          VER_CODE=""
+          if [ -f version.properties ]; then
+            VER_NAME=$(grep -E '^VERSION_NAME=' version.properties | cut -d= -f2- | tr -d '\r' || true)
+            VER_CODE=$(grep -E '^VERSION_CODE=' version.properties | cut -d= -f2- | tr -d '\r' || true)
+          fi
+          if [ -z "$VER_NAME" ]; then
+            VER_NAME="ci-$(date +%Y%m%d%H%M%S)"
+          fi
+          if [ -z "$VER_CODE" ]; then
+            VER_CODE="0"
+          fi
+          echo "ver_name=$VER_NAME" >> "$GITHUB_OUTPUT"
+          echo "ver_code=$VER_CODE" >> "$GITHUB_OUTPUT"
+
+      - name: Create Git tag for release (optional)
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Use the version output to create a unique tag including version code
+          VER_NAME="${{ steps.set-ver.outputs.ver_name }}"
+          VER_CODE="${{ steps.set-ver.outputs.ver_code }}"
+          if [ -n "$VER_NAME" ] && [ -n "$VER_CODE" ]; then
+            TAG="v${VER_NAME}-${VER_CODE}"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" -m "Release $TAG" || echo "tag exists or failed"
+            git push origin "$TAG" || echo "push tag failed"
+          else
+            echo "VERSION_NAME or VERSION_CODE not set; skipping tag creation"
+          fi
+  publish-release:
+    name: Publish Release and upload artifacts
+    needs: build-release
+    if: github.ref != 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: ./artifacts
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Create or update GitHub Release and upload assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          VER_NAME: ${{ needs.build-release.outputs.ver_name }}
+          VER_CODE: ${{ needs.build-release.outputs.ver_code }}
+        run: |
+          chmod +x scripts/release_attach.sh || true
+          ./scripts/release_attach.sh
+
+      - name: Increment version for next release and push
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "Preparing to increment VERSION_CODE for next release"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Checkout default branch to modify version.properties
+          git checkout master
+          # Set up JDK/Gradle environment
+          sudo apt-get update
+          sudo apt-get install -y openjdk-17-jdk
+          ./gradlew :app:incrementVersionCode --no-daemon --stacktrace
+          if git add version.properties && git commit -m "ci: bump version for next release [skip ci]"; then
+            echo "Committed bumped version.properties"
+            git push origin HEAD:master || echo "git push failed"
+          else
+            echo "No changes to commit or commit failed"
+          fi

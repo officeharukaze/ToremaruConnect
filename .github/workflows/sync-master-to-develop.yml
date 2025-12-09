@@ -1,0 +1,77 @@
+name: Sync master -> develop
+
+on:
+  push:
+    branches: [ master ]
+  workflow_run:
+    workflows: [ "Release Build" ]
+    types: [ completed ]
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Sync master into develop
+    runs-on: ubuntu-latest
+    # Run if triggered by push, or if triggered by workflow_run and the workflow succeeded
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Ensure develop branch exists
+        id: ensure
+        run: |
+          if git ls-remote --heads origin develop | grep -q develop; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create develop from master (when missing)
+        if: steps.ensure.outputs.exists == 'false'
+        run: |
+          git checkout -b develop
+          git push origin develop
+
+      - name: Merge master into develop
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Fetch latest refs
+          git fetch origin develop
+          git fetch origin master
+
+          # Switch to develop
+          git checkout develop
+          # Ensure local develop is up-to-date with remote develop
+          git reset --hard origin/develop || true
+
+          # Try fast-forward merge from master
+          if git merge --ff-only origin/master; then
+            echo "Fast-forwarded develop to origin/master"
+          else
+            echo "Fast-forward failed — creating a merge commit"
+            # Create a merge commit so develop contains master changes
+            git merge --no-edit origin/master || true
+          fi
+
+          # Compare local develop with remote develop
+          REMOTE_HASH=$(git ls-remote origin develop | cut -f1 || true)
+          LOCAL_HASH=$(git rev-parse HEAD || true)
+          if [ "$LOCAL_HASH" != "$REMOTE_HASH" ]; then
+            # Push changes to develop. Add [skip ci] to avoid triggering CI loops.
+            git commit --allow-empty -m "chore: sync master -> develop [skip ci]" || true
+            git push origin develop
+            echo "Pushed develop updates"
+          else
+            echo "develop already up to date with master"
+          fi

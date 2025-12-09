@@ -1,34 +1,38 @@
-# Gradle files
-.gradle/
-build/
+# === macOS ===
+.DS_Store
+.AppleDouble
+.LSOverride
 
-# Local configuration file (sdk path, etc)
-local.properties
-
-# Log/OS Files
-*.log
-
-# Android Studio generated files and folders
-captures/
-.externalNativeBuild/
-.cxx/
-*.aab
-*.apk
-output-metadata.json
-
-# IntelliJ
+# === JetBrains/Android Studio ===
 *.iml
 .idea/
-misc.xml
-deploymentTargetDropDown.xml
-render.experimental.xml
 
-# Keystore files
+# === Gradle ===
+.gradle/
+build/
+*/build/
+.vscode/
+
+# Kotlin/Java build caches
+.kotlin/
+
+# === NDK / C++ ===
+.cxx/
+.externalNativeBuild/
+*/.cxx/
+*/.externalNativeBuild/
+
+# === Android local configs ===
+local.properties
+/local.properties
+
+# Signing artifacts (do NOT commit secrets)
 *.jks
 *.keystore
+keystore.properties
 
-# Google Services (e.g. APIs or Firebase)
-google-services.json
+# === Misc ===
+captures/
+/.external_repos/
+*.log
 
-# Android Profiling
-*.hprof
